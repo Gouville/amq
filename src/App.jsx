@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import './App.css';
 
 // AMQ‑SRS Trainer — single‑file React component
 // Features

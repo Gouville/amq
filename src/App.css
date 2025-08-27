@@ -1,42 +1,166 @@
+/* Thème sombre esthétique — plug‑and‑play
+   - Palette basée sur des variables CSS (peut être ajustée).
+   - Style global + formulaires, boutons, tableaux, cartes, progress bar.
+   - Compatibilité avec ton App.jsx (inputs, tables, boutons, .border, .rounded-2xl, etc.).
+   - Par défaut: DARK. Ajoute [data-theme="light"] sur <html> si tu veux basculer.
+*/
+
+/* ===== Variables ===== */
+:root {
+  --bg: #0b0f14;         /* fond principal */
+  --bg-muted: #0f141a;   /* surface secondaire */
+  --bg-elev: #121923;    /* carte / panneau */
+  --text: #e6e9ee;       /* texte principal */
+  --text-dim: #9aa7b1;   /* texte faible */
+  --primary: #6ea8ff;    /* action / liens */
+  --primary-strong: #2f80ff;
+  --accent: #9b8cff;     /* accent doux */
+  --success: #3ddc97;
+  --warn: #ffd166;
+  --danger: #ff6b6b;
+  --border: #1f2a36;     /* contours subtils */
+  --ring: rgba(110,168,255,.4); /* focus ring */
+  --shadow: 0 10px 30px rgba(0,0,0,.35);
+  --radius-xl: 16px;
+  --radius-lg: 12px;
+  --radius-md: 10px;
+  --radius-sm: 8px;
+}
+
+html, body, #root { height: 100%; }
+
+/* ===== Fond + typo ===== */
+body {
+  background: linear-gradient(180deg, var(--bg) 0%, #0a0e13 100%), var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* conteneur par défaut (#root existe déjà dans App.css) */
 #root {
-  max-width: 1280px;
+  max-width: 1100px;
   margin: 0 auto;
   padding: 2rem;
-  text-align: center;
+  text-align: left;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
-}
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
-}
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafbaa);
+/* ===== Liens ===== */
+a { color: var(--primary); text-decoration: none; }
+a:hover { color: var(--primary-strong); text-decoration: underline; }
+
+/* ===== Cartes / panneaux ===== */
+.card, .panel, section[role="group"], section.bg-white, section.bg-gray-50, .shadow-sm {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow);
 }
 
-@keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+/* ===== Bordures / arrondis utilitaires ===== */
+.border { border: 1px solid var(--border) !important; }
+.rounded-2xl { border-radius: var(--radius-xl) !important; }
+.rounded-xl  { border-radius: var(--radius-lg) !important; }
+.rounded-lg  { border-radius: var(--radius-md) !important; }
+.rounded-md  { border-radius: var(--radius-sm) !important; }
+
+/* ===== Couleurs utilitaires (override Tailwind si présent) ===== */
+.bg-white, .bg-gray-50, .bg-gray-100 { background: var(--bg-elev) !important; }
+.text-gray-900 { color: var(--text) !important; }
+.text-gray-600 { color: var(--text-dim) !important; }
+
+/* ===== Boutons ===== */
+button, .btn {
+  background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(0,0,0,.05));
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: .6rem 1rem;
+  cursor: pointer;
+  transition: transform .06s ease, background .2s ease, box-shadow .2s ease, opacity .2s ease;
+}
+button:hover, .btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(0,0,0,.35); }
+button:active, .btn:active { transform: translateY(0); }
+button:disabled { opacity: .55; cursor: not-allowed; }
+
+/* variantes rapides */
+.btn--primary, .bg-black.text-white, .btn.primary {
+  background: radial-gradient(120% 120% at 50% 0%, var(--primary-strong) 0%, #1f4fff 40%, #0e2b90 100%);
+  color: #fff; border-color: transparent;
+}
+.btn--danger { background: linear-gradient(180deg, #ff8080, #c93636); color: #fff; border-color: #c23b3b; }
+.btn--ghost  { background: transparent; border-color: var(--border); }
+
+/* ===== Inputs ===== */
+input, textarea, select {
+  background: var(--bg-muted);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  padding: .65rem .9rem;
+  outline: none;
+  transition: border-color .2s ease, box-shadow .2s ease;
+}
+input::placeholder { color: var(--text-dim); }
+input:focus, textarea:focus, select:focus { box-shadow: 0 0 0 4px var(--ring); border-color: var(--primary-strong); }
+
+/* ===== Tableau (deck) ===== */
+.table, table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.table th, .table td, table th, table td {
+  padding: .8rem .9rem;
+  border-bottom: 1px solid var(--border);
+}
+.table thead th, table thead th { text-transform: uppercase; font-size: .75rem; letter-spacing: .06em; color: var(--text-dim); }
+.table tbody tr:hover, table tbody tr:hover { background: #0f1621; }
+
+/* ===== Badges & états ===== */
+.badge { display: inline-block; padding: .25rem .5rem; border-radius: 999px; font-size: .75rem; }
+.badge.success { background: rgba(61,220,151,.15); color: var(--success); border: 1px solid rgba(61,220,151,.3); }
+.badge.warn { background: rgba(255,209,102,.12); color: var(--warn); border: 1px solid rgba(255,209,102,.3); }
+.badge.danger { background: rgba(255,107,107,.12); color: var(--danger); border: 1px solid rgba(255,107,107,.3); }
+
+/* ===== Progress bar ===== */
+.progress { height: 8px; background: #0f1621; border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+.progress__bar { height: 100%; background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%); }
+
+/* ===== Vidéo container ===== */
+.video-shell { position: relative; width: 100%; max-width: 760px; aspect-ratio: 16/9; border-radius: var(--radius-lg); overflow: hidden; background: #000; border: 1px solid var(--border); }
+.video-shell video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+
+/* ===== Petites utilitaires d'espace (si Tailwind absent) ===== */
+.p-2{padding:.5rem!important}.p-3{padding:.75rem!important}.p-4{padding:1rem!important}.p-6{padding:1.5rem!important}
+.px-3{padding-left:.75rem!important;padding-right:.75rem!important}.px-4{padding-left:1rem!important;padding-right:1rem!important}.px-6{padding-left:1.5rem!important;padding-right:1.5rem!important}
+.py-2{padding-top:.5rem!important;padding-bottom:.5rem!important}.py-4{padding-top:1rem!important;padding-bottom:1rem!important}
+.mb-2{margin-bottom:.5rem!important}.mb-3{margin-bottom:.75rem!important}.mb-4{margin-bottom:1rem!important}.mb-6{margin-bottom:1.5rem!important}.mt-6{margin-top:1.5rem!important}.mt-8{margin-top:2rem!important}
+.grid{display:grid!important}.gap-2{gap:.5rem!important}.gap-3{gap:.75rem!important}.gap-4{gap:1rem!important}
+.flex{display:flex!important}.items-center{align-items:center!important}.justify-between{justify-content:space-between!important}.justify-center{justify-content:center!important}
+.w-full{width:100%!important}.max-w-4xl{max-width:56rem!important}.mx-auto{margin-left:auto!important;margin-right:auto!important}
+.text-left{text-align:left!important}.text-center{text-align:center!important}
+.text-xs{font-size:.75rem!important}.text-sm{font-size:.875rem!important}.text-lg{font-size:1.125rem!important}.text-xl{font-size:1.25rem!important}.text-2xl{font-size:1.5rem!important}
+.font-bold{font-weight:700!important}.font-normal{font-weight:400!important}
+.underline{text-decoration:underline!important}
+.overflow-x-auto{overflow-x:auto!important}
+
+/* ===== Effets ===== */
+.hover\:bg-gray-50:hover { background: #101824 !important; }
+
+/* ===== Mode clair optionnel ===== */
+html[data-theme="light"] {
+  --bg: #f7f9fc; --bg-muted: #ffffff; --bg-elev:#ffffff; --text:#0b1220; --text-dim:#5b6b7a;
+  --primary:#1f4fff; --primary-strong:#0a36ff; --accent:#6e4fff; --border:#e6ebf2; --ring:rgba(31,79,255,.25);
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  a:nth-of-type(2) .logo {
-    animation: logo-spin infinite 20s linear;
-  }
-}
+/* ===== Accessibilité ===== */
+:focus-visible { outline: 0; box-shadow: 0 0 0 4px var(--ring); border-radius: 8px; }
 
-.card {
-  padding: 2em;
-}
-
-.read-the-docs {
-  color: #888;
-}
+/* ===== Petites animations ===== */
+@keyframes subtle-pop { from { transform: translateY(3px); opacity:.7 } to { transform: translateY(0); opacity:1 } }
+section, .card, .panel { animation: subtle-pop .24s ease both; }
