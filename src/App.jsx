@@ -1,69 +1,58 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import './App.css';
 
-// AMQ‑SRS Trainer — single‑file React component
-// Features
-// - Fetch your AniList anime
-// - Fetch openings (OP) from AnimeThemes.moe mapped by AniList ID
-// - Build SRS flashcards (SM‑2 like) with grades: Again / Hard / Good / Easy
-// - LocalStorage persistence of card scheduling
-// - Play video/audio preview if available; reveal answer; type to self‑check
-// - Simple filters + progress indicators
-// - Rate‑limit friendly: retry with backoff + delay between requests + local cache + import cap
-// - Incremental import + progress bar + start reviewing while importing
-
+// AMQ-SRS Trainer — single-file React component
 const ANILIST_GQL = "https://graphql.anilist.co";
-//const ANIMETHEMES_API = "https://api.animethemes.moe/anime";
 const ANIMETHEMES_API = "https://api.animethemes.moe";
 
 // ---- Tunables / Defaults ----
-const DEFAULT_DELAY_MS = 500; // polite delay between external requests
-const MAX_RETRIES = 6;        // exponential backoff retries for 429/5xx
-const JITTER_MS = 120;        // random jitter to avoid thundering herd
-const DEFAULT_MAX_SHOWS = 250;// cap imported shows per run to avoid bursts
+const DEFAULT_DELAY_MS = 500;
+const DEFAULT_MAX_SHOWS = 1000;
+const MAX_STORAGE_SIZE_MB = 5; // Limite approximative en Mo
+const MAX_CARDS_PER_SERIES = 5; // Limite d'OP par série
 
-// ---- SRS (SM-2 simplified) ----
-function sm2Schedule(card, quality) {
-  // card: { ef, interval, reps, due } (ms)
-  // quality: 0(Again), 1(Hard), 2(Good), 3(Easy)
+// ---- SRS (simplified) ----
+function sm2Schedule(card, quality, easyDelayHours, diffAgain) {
   const now = Date.now();
-  let { ef = 2.5, interval = 0, reps = 0 } = card || {};
+  let { interval = 0, reps = 0, attempts = 0, successes = 0, due = now + 24 * 60 * 60 * 1000 } = card?.srs || {};
 
-  if (quality === 0) {
-    // Again → relearn: next in 10 minutes
-    return { ef: Math.max(1.3, ef - 0.2), interval: 10 * 60 * 1000, reps: 0, due: now + 10 * 60 * 1000 };
+  attempts += 1;
+  if (quality > 0) {
+    successes += 1;
   }
 
-  // Convert to 0..5 scale for EF update (Hard≈3, Good≈4, Easy≈5)
-  const qMap = [2, 3, 4, 5];
-  const q = qMap[quality];
-  ef = ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02));
-  ef = Math.max(1.3, Math.min(2.8, ef));
+  reps += 1;
 
-  if (reps === 0) {
-    interval = 24 * 60 * 60 * 1000; // 1 day
-  } else if (reps === 1) {
-    interval = 6 * 24 * 60 * 60 * 1000; // 6 days
-  } else {
-    interval = Math.round(interval * ef);
+  if (quality === 2) {  // Easy
+    interval = easyDelayHours * 60 * 60 * 1000;
+    due = now + interval;
+  } else if (quality === 1) {  // Hard
+    interval = 0;
+    due = now;
+  } else {  // Again
+    interval = diffAgain ? 10 * 60 * 1000 : 0;
+    due = now + interval;
   }
 
-  return { ef, interval, reps: reps + 1, due: now + interval };
+  return { interval, reps, attempts, successes, due };
 }
 
 // ---- LocalStorage helpers ----
-const STORAGE_KEY = "amq_srs_state_v1";               // scheduling only
-const STORAGE_CACHE = "amq_srs_cache_v1";             // per‑anime OP cache { [anilistId]: openings[] }
-const STORAGE_SETTINGS = "amq_srs_settings_v1";        // delay/maxShows
+const STORAGE_KEY = "amq_srs_state_v1";
+const STORAGE_CACHE = "amq_srs_cache_v1";
+const STORAGE_SETTINGS = "amq_srs_settings_v1";
 const STORAGE_CARDS = "amq_srs_cards_v1";
 
 function loadCards() {
   try { return JSON.parse(localStorage.getItem(STORAGE_CARDS) || "[]"); } catch { return []; }
 }
 function saveCards(cs) {
-  localStorage.setItem(STORAGE_CARDS, JSON.stringify(cs));
+  const sizeInMB = new Blob([localStorage.getItem(STORAGE_CARDS) || "[]"], { type: 'application/json' }).size / (1024 * 1024);
+  if (sizeInMB > MAX_STORAGE_SIZE_MB) {
+    localStorage.removeItem(STORAGE_CARDS); // Purge si limite atteinte
+  }
+  localStorage.setItem(STORAGE_CARDS, JSON.stringify(cs.slice(0, DEFAULT_MAX_SHOWS)));
 }
-
 
 function loadState() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch { return {}; }
@@ -79,14 +68,13 @@ function loadSettings() {
 function saveSettings(s) { localStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s)); }
 
 // ---- Utils ----
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function dedupeById(arr) {
   const map = new Map();
-  for (const c of arr || []) map.set(c.id, c); // keep last occurrence per id
+  for (const c of arr || []) map.set(c.id, c);
   return Array.from(map.values());
 }
 
-// ---- Networking helpers with retry/backoff ----
 async function fetchJSON(url, opts) {
   let attempt = 0;
   while (true) {
@@ -94,22 +82,21 @@ async function fetchJSON(url, opts) {
     if (r.ok) return r.json();
 
     const status = r.status;
-    // Respect Retry-After if present
     const retryAfter = Number(r.headers.get("Retry-After"));
     if (status === 429 || (status >= 500 && status < 600)) {
-      if (attempt >= MAX_RETRIES) {
-        const text = await r.text().catch(()=>"");
+      if (attempt >= 6) {
+        const text = await r.text().catch(() => "");
         throw new Error(`${status} ${r.statusText}${text ? ` — ${text}` : ""}`);
       }
       const backoff = retryAfter
         ? Math.max(1000, retryAfter * 1000)
-        : Math.min(1000 * Math.pow(2, attempt), 16000) + Math.floor(Math.random() * JITTER_MS);
+        : Math.min(1000 * Math.pow(2, attempt), 16000) + Math.floor(Math.random() * 120);
       await sleep(backoff);
       attempt += 1;
       continue;
     }
 
-    const text = await r.text().catch(()=>"");
+    const text = await r.text().catch(() => "");
     throw new Error(`${status} ${r.statusText}${text ? ` — ${text}` : ""}`);
   }
 }
@@ -118,17 +105,151 @@ async function postJSON(url, body) {
   return fetchJSON(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
-// ---- Data shapes ----
-// Card id: `${anilistId}::OP${seq || 1}`
-// Card data: { id, anilistId, titleRomaji, titleEnglish, titleNative, season, year, opNumber, songTitle, artists, videoUrl }
-
 function shuffle(array) {
   const a = [...array];
   for (let i = a.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
+    [a[i], a[j] = [a[j], a[i]];
   }
   return a;
+}
+
+// ---- Import Logic ----
+async function importAnilist(setCards, setLoading, setError, cards, username) {
+  try {
+    setLoading(true);
+    setError("");
+    if (!username) {
+      setError("Veuillez entrer un nom d'utilisateur AniList.");
+      setLoading(false);
+      return;
+    }
+
+    let allEntries = [];
+    let globalIndex = 0;
+
+    const query = `
+      query ($username: String) {
+        MediaListCollection(userName: $username, type: ANIME) {
+          lists {
+            entries {
+              media {
+                id
+                title {
+                  romaji
+                  english
+                  native
+                }
+                streamingEpisodes {
+                  title
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const variables = { username };
+    const response = await postJSON(ANILIST_GQL, { query, variables });
+    console.log("Réponse API complète:", response);
+
+    const { MediaListCollection } = response.data;
+    const entries = MediaListCollection.lists.flatMap(list => list.entries.map(entry => entry.media));
+    console.log("Entrées brutes:", entries.length);
+
+    allEntries = allEntries.concat(entries);
+
+    const newCards = [];
+    const seenOps = new Map(); // Map pour suivre les OP uniques par série
+
+    allEntries.forEach(media => {
+      const seriesCards = [];
+      const uniqueOps = new Set();
+      (media.streamingEpisodes || []).slice(0, MAX_CARDS_PER_SERIES).forEach((episode, index) => {
+        globalIndex += 1;
+        const opNumber = index + 1;
+        const uniqueKey = `${media.id}::OP${opNumber}::${episode.url || 'none'}`;
+        if (episode.url && !seenOps.has(uniqueKey) && !uniqueOps.has(opNumber)) {
+          uniqueOps.add(opNumber);
+          seenOps.set(uniqueKey, true);
+          seriesCards.push({
+            id: `${media.id}::OP${opNumber}::${globalIndex}`,
+            titleRomaji: media.title.romaji || media.title.english || media.title.native,
+            opNumber: opNumber,
+            videoUrl: episode.url,
+            artists: [],
+            songTitle: `Opening ${opNumber}`, // Forcé à "Opening X" au lieu de episode.title
+            srs: { due: Date.now() + 24 * 60 * 60 * 1000 },
+          });
+        }
+      });
+      if (seriesCards.length > 0) newCards.push(...seriesCards);
+      // Fallback pour les séries sans épisodes
+      if (seriesCards.length === 0) {
+        globalIndex += 1;
+        const fallbackId = `${media.id}::OP1::${globalIndex}`;
+        if (!seenOps.has(fallbackId)) {
+          seenOps.set(fallbackId, true);
+          newCards.push({
+            id: fallbackId,
+            titleRomaji: media.title.romaji || media.title.english || media.title.native,
+            opNumber: 1,
+            videoUrl: null,
+            artists: [],
+            songTitle: `Opening 1`,
+            srs: { due: Date.now() + 24 * 60 * 60 * 1000 },
+          });
+        }
+      }
+    });
+    console.log("Cartes générées:", newCards.length);
+
+    setCards(c => dedupeById([...c, ...newCards]).slice(0, DEFAULT_MAX_SHOWS));
+    saveCards([...cards, ...newCards].slice(0, DEFAULT_MAX_SHOWS));
+  } catch (err) {
+    setError(`Erreur lors de l'import : ${err.message}`);
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ---- Toast Component ----
+function Toast({ message, onClose }) {
+  useEffect(() => {
+    const t = setTimeout(onClose, 3000);
+    return () => clearTimeout(t);
+  }, [onClose]);
+  return (
+    <div className="toast animate-fadeIn">
+      {message}
+    </div>
+  );
+}
+
+// ---- Error Boundary ----
+class ErrorBoundary extends React.Component {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-6 bg-red-50 text-red-700 rounded-xl">
+          <h2>Une erreur est survenue</h2>
+          <p>{this.state.error.message}</p>
+          <button onClick={() => this.setState({ hasError: false, error: null })} className="mt-2 btn--primary">
+            Réessayer
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default function AMQSrsTrainer() {
@@ -136,519 +257,460 @@ export default function AMQSrsTrainer() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [cards, setCards] = useState(loadCards());
-  const [srs, setSrs] = useState(loadState()); // id -> {ef, interval, reps, due}
+  const [srs, setSrs] = useState(loadState());
   const [filterQuery, setFilterQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showAnswer, setShowAnswer] = useState(false);
   const [hideVideo, setHideVideo] = useState(false);
   const answerRef = useRef(null);
+  const idsRef = useRef(new Set());
+  const [importProgress, setImportProgress] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [toast, setToast] = useState("");
+  const [theme, setTheme] = useState(localStorage.getItem("theme") || "dark");
+  const [lastGrade, setLastGrade] = useState(null);
+  const [currentCard, setCurrentCard] = useState(null);
 
   const initSettings = loadSettings();
   const [delayMs, setDelayMs] = useState(Number.isFinite(initSettings.delayMs) ? initSettings.delayMs : DEFAULT_DELAY_MS);
   const [maxShows, setMaxShows] = useState(Number.isFinite(initSettings.maxShows) ? initSettings.maxShows : DEFAULT_MAX_SHOWS);
+  const [easyDelayHours, setEasyDelayHours] = useState(Number.isFinite(initSettings.easyDelayHours) ? initSettings.easyDelayHours : 48);
+  const [diffAgain, setDiffAgain] = useState(!!initSettings.diffAgain);
+  const [autoPlay, setAutoPlay] = useState(true);
+  const [sortMode, setSortMode] = useState(initSettings.sortMode || "alpha");
   const [cache, setCache] = useState(loadCache());
 
-  // incremental import support
-  const idsRef = useRef(new Set());
-  const cancelImportRef = useRef(false);
-  const [progress, setProgress] = useState({ totalShows: 0, processedShows: 0, totalOps: 0 });
+  useEffect(() => {
+    saveSettings({ delayMs, maxShows, easyDelayHours, diffAgain, autoPlay, sortMode });
+  }, [delayMs, maxShows, easyDelayHours, diffAgain, autoPlay, sortMode]);
 
-  useEffect(() => { saveState(srs); }, [srs]);
-  useEffect(() => { saveCache(cache); }, [cache]);
-  useEffect(() => { saveSettings({ delayMs, maxShows }); }, [delayMs, maxShows]);
-  useEffect(() => { saveCards(cards); }, [cards]);
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("theme", theme);
+  }, [theme]);
 
-  // Compute due cards
-  const now = Date.now();
-  const deck = useMemo(() => {
-    const q = filterQuery.trim().toLowerCase();
-    const filtered = cards.filter(c => {
-      if (!q) return true;
-      const hay = [c.titleRomaji, c.titleEnglish, c.titleNative, c.songTitle, c.artists]
-        .join(" ")
-        .toLowerCase();
-      return hay.includes(q);
-    });
-    const withMeta = filtered.map(c => ({
-      ...c,
-      srs: srs[c.id] || { ef: 2.5, interval: 0, reps: 0, due: 0 },
-    }));
-    const due = withMeta.filter(c => (c.srs.due || 0) <= now);
-    const later = withMeta.filter(c => (c.srs.due || 0) > now);
-
-    // mélanger au lieu de trier
-    return { all: withMeta, due: shuffle(due), later: shuffle(later) };
-  }, [cards, srs, filterQuery]);
-
-  const current = deck.due[0] || deck.later[0];
-
-  async function getAniListUserId(name) {
-    const query = `query($name:String){ User(name:$name){ id name } }`;
-    const data = await postJSON(ANILIST_GQL, { query, variables: { name } });
-    const u = data?.data?.User;
-    if (!u) throw new Error("Utilisateur AniList introuvable");
-    return u.id;
-  }
-
-  async function getAniListAnime(userId) {
-    const query = `query($userId:Int,$page:Int,$perPage:Int){
-      Page(page:$page,perPage:$perPage){
-        mediaList(userId:$userId,type:ANIME,status_in:[CURRENT,COMPLETED,REPEATING,PAUSED,DROPPED,PLANNING]){
-          media{ id title{romaji english native} season seasonYear }
-        }
-        pageInfo{ hasNextPage }
+  useEffect(() => {
+    const handleKey = (e) => {
+      if (showAnswer && currentCard) {
+        if (e.key === "a" || e.key === "1") grade(0);
+        if (e.key === "h" || e.key === "2") grade(1);
+        if (e.key === "e" || e.key === "3") grade(2);
+      } else if (e.key === "Enter" && answerRef.current) {
+        setShowAnswer(true);
       }
-    }`;
-    let page = 1, perPage = 50, out = [];
-    while (true) {
-      const data = await postJSON(ANILIST_GQL, { query, variables: { userId, page, perPage } });
-      const list = data?.data?.Page?.mediaList || [];
-      for (const it of list) {
-        const m = it.media;
-        out.push({
-          anilistId: m.id,
-          titleRomaji: m.title?.romaji || "",
-          titleEnglish: m.title?.english || "",
-          titleNative: m.title?.native || "",
-          season: m.season || "",
-          year: m.seasonYear || null,
-        });
-      }
-      const hasNext = data?.data?.Page?.pageInfo?.hasNextPage;
-      if (!hasNext) break;
-      page += 1;
-      await sleep(400); // be gentle with AniList paging
-    }
-    return out;
-  }
-
-  async function getOpeningsForAniListId(anilistId, titles = {}) {
-    // cache
-    const cached = cache[String(anilistId)];
-    if (cached) return cached;
-  
-    async function fetchByUrl(url) {
-      const data = await fetchJSON(url);
-      const animeArr = Array.isArray(data?.anime) ? data.anime : [];
-      if (!animeArr.length) return [];
-      const a = animeArr[0];
-  
-      const results = [];
-      for (const t of a.animethemes || []) {
-        if ((t?.type ?? "").toUpperCase() !== "OP") continue;
-  
-        const number = t?.sequence ?? null;
-        const songTitle = t?.song?.title ?? "";
-        let videoUrl = "";
-  
-        for (const e of t?.animethemeentries || []) {
-          const vids = e?.videos || [];
-          if (vids.length) {
-            videoUrl = vids[0]?.link || vids[0]?.audio || "";
-            if (videoUrl) break;
-          }
-        }
-  
-        results.push({
-          type: "OP",
-          number,
-          songTitle,
-          artists: "",
-          videoUrl,
-        });
-      }
-      return results;
-    }
-  
-    // --- On ne tente plus par AniList ID (bug API) ---
-    let results = [];
-    if (titles?.titleRomaji) {
-      results = await fetchByUrl(
-        `https://api.animethemes.moe/anime?filter[name]=${encodeURIComponent(
-          titles.titleRomaji
-        )}&include=animethemes,animethemes.song,animethemes.animethemeentries,animethemes.animethemeentries.videos`
-      );
-    }
-    if (results.length === 0 && titles?.titleEnglish) {
-      results = await fetchByUrl(
-        `https://api.animethemes.moe/anime?filter[name]=${encodeURIComponent(
-          titles.titleEnglish
-        )}&include=animethemes,animethemes.song,animethemes.animethemeentries,animethemes.animethemeentries.videos`
-      );
-    }
-    if (results.length === 0 && titles?.titleNative) {
-      results = await fetchByUrl(
-        `https://api.animethemes.moe/anime?filter[name]=${encodeURIComponent(
-          titles.titleNative
-        )}&include=animethemes,animethemes.song,animethemes.animethemeentries,animethemes.animethemeentries.videos`
-      );
-    }
-  
-    const newCache = { ...cache, [String(anilistId)]: results };
-    setCache(newCache);
-    return results;
-  }
-  
-  
-  
-  
-  
-  
-  
-  async function buildDeckFromAniList(name) {
-    setError("");
-    setLoading(true);
-    setShowAnswer(false);
-    cancelImportRef.current = false;
-    idsRef.current = new Set(cards.map(c=>c.id));
-    try {
-      const uid = await getAniListUserId(name.trim());
-      const anime = await getAniListAnime(uid);
-      const list = anime.slice(0, Math.max(10, maxShows)); // cap to reduce rate limit hits
-      if (list.length === 0) throw new Error("Aucun anime trouvé pour cet utilisateur (profil vide ou privé)");
-      setProgress({ totalShows: list.length, processedShows: 0, totalOps: 0 });
-      for (const m of list) {
-        if (cancelImportRef.current) break;
-        try {
-          const ops = await getOpeningsForAniListId(m.anilistId, {
-            titleRomaji: m.titleRomaji,
-            titleEnglish: m.titleEnglish,
-            titleNative: m.titleNative,
-          });
-          let added = 0;
-          const newCards = [];
-          for (const op of ops) {
-            const id = `${m.anilistId}::OP${op.number || 1}`;
-            if (!idsRef.current.has(id)) {
-              idsRef.current.add(id);
-              newCards.push({
-                id,
-                anilistId: m.anilistId,
-                titleRomaji: m.titleRomaji,
-                titleEnglish: m.titleEnglish,
-                titleNative: m.titleNative,
-                season: m.season,
-                year: m.year,
-                opNumber: op.number,
-                songTitle: op.songTitle,
-                artists: op.artists,
-                videoUrl: op.videoUrl,
-              });
-              added += 1;
-            }
-          }
-          if (newCards.length) setCards(prev => dedupeById([...(prev || []), ...newCards]));
-          setProgress(prev => ({ ...prev, processedShows: prev.processedShows + 1, totalOps: prev.totalOps + added }));
-        } catch (e) {
-          setProgress(prev => ({ ...prev, processedShows: prev.processedShows + 1 }));
-        }
-        // polite delay (user‑configurable) to avoid 429
-        await sleep(delayMs + Math.floor(Math.random()*JITTER_MS));
-      }
-      // final dedupe + message explicite si 0 carte
-      setCards(prev => {
-        const deduped = dedupeById(prev || []);
-        if (deduped.length === 0) {
-          setError("Aucun OP trouvé via AnimeThemes pour tes séries (le mapping AniList → AnimeThemes a peut-être échoué pour ce compte).");
-        }
-        return deduped;
-    });
-    } catch (e) {
-      setError(e?.message || String(e));
-      setCards([]);
-    } finally {
-      setLoading(false);
-    }
-  }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [showAnswer, currentCard]);
 
   function grade(quality) {
-    if (!current) return;
-    const next = sm2Schedule(srs[current.id], quality);
-    setSrs(prev => ({ ...prev, [current.id]: next }));
-    setShowAnswer(false);
+    if (!currentCard) return;
+    const prevSrs = srs[currentCard.id];
+    setLastGrade({ id: currentCard.id, prevSrs });
+    const newSrs = sm2Schedule(currentCard, quality, easyDelayHours, diffAgain);
+    setSrs(s => ({ ...s, [currentCard.id]: newSrs }));
+    setToast(`Noté : ${["Again", "Hard", "Easy"][quality]}`);
+    if (hideVideo) {
+      setShowAnswer(false);
+      if (answerRef.current) {
+        answerRef.current.value = "";
+        answerRef.current.focus();
+      }
+      const newCurrent = deck.due.length > 0 ? shuffle(deck.due)[0] : (deck.later.length > 0 ? shuffle(deck.later)[0] : null);
+      setCurrentCard(newCurrent);
+    } else {
+      setTimeout(() => {
+        setShowAnswer(false);
+        if (answerRef.current) {
+          answerRef.current.value = "";
+          answerRef.current.focus();
+        }
+        const newCurrent = deck.due.length > 0 ? shuffle(deck.due)[0] : (deck.later.length > 0 ? shuffle(deck.later)[0] : null);
+        setCurrentCard(newCurrent);
+      }, 500);
+    }
   }
 
-  function resetProgress() {
-    if (!confirm("Reset all scheduling data?")) return;
-    setSrs({});
+  function undoGrade() {
+    if (!lastGrade) return;
+    setSrs(s => ({ ...s, [lastGrade.id]: lastGrade.prevSrs }));
+    setLastGrade(null);
+    setToast("Undo effectué");
   }
 
-  function clearCache() {
-    if (!confirm("Effacer le cache local des OP (AnimeThemes)?")) return;
-    setCache({});
-  }
+  const deck = useMemo(() => {
+    const now = Date.now();
+    const all = cards.map(c => ({ ...c, srs: srs[c.id] || {} }));
+    const filtered = all.filter(c => {
+      if (!filterQuery) return true;
+      const q = filterQuery.toLowerCase();
+      return (
+        (c.titleRomaji || "").toLowerCase().includes(q) ||
+        (c.titleEnglish || "").toLowerCase().includes(q) ||
+        (c.titleNative || "").toLowerCase().includes(q) ||
+        (c.songTitle || "").toLowerCase().includes(q) ||
+        (c.artists || []).some(a => a.toLowerCase().includes(q))
+      );
+    });
+    const due = filtered.filter(c => !c.srs.due || c.srs.due <= now);
+    const later = filtered.filter(c => c.srs.due && c.srs.due > now);
+    return { all: filtered, due, later };
+  }, [cards, srs, filterQuery]);
 
-  function cancelImport() { cancelImportRef.current = true; }
+  const sortedDeck = useMemo(() => {
+    return [...deck.all].sort((a, b) => {
+      if (sortMode === "due") {
+        const dueA = a.srs?.due || 0;
+        const dueB = b.srs?.due || 0;
+        return dueA - dueB || (a.titleRomaji || a.titleEnglish || a.titleNative || "").localeCompare(b.titleRomaji || b.titleEnglish || b.titleNative || "");
+      }
+      if (sortMode === "success") {
+        const successA = a.srs?.attempts > 0 ? a.srs.successes / a.srs.attempts : 0;
+        const successB = b.srs?.attempts > 0 ? b.srs.successes / b.srs.attempts : 0;
+        return successB - successA || (a.titleRomaji || a.titleEnglish || a.titleNative || "").localeCompare(b.titleRomaji || b.titleEnglish || b.titleNative || "");
+      }
+      const titleA = (a.titleRomaji || a.titleEnglish || a.titleNative || "").toLowerCase();
+      const titleB = (b.titleRomaji || b.titleEnglish || b.titleNative || "").toLowerCase();
+      return titleA.localeCompare(titleB);
+    });
+  }, [deck.all, sortMode]);
 
-  // ---- Lightweight self-tests (run via Settings) ----
-  const [testResults, setTestResults] = useState([]);
-  function runSelfTests() {
-    const results = [];
+  const globalStats = useMemo(() => {
+    const totalCards = deck.all.length;
+    const dueCards = deck.due.length;
+    const totalAttempts = deck.all.reduce((sum, c) => sum + (c.srs.attempts || 0), 0);
+    const totalSuccesses = deck.all.reduce((sum, c) => sum + (c.srs.successes || 0), 0);
+    const successRate = totalAttempts > 0 ? Math.round((totalSuccesses / totalAttempts) * 100) : 0;
+    return { totalCards, dueCards, successRate };
+  }, [deck]);
 
-    function expect(label, cond) { results.push({ label, pass: !!cond }); }
+  useEffect(() => {
+    let newCurrent;
+    if (deck.all.length > 0) {
+      newCurrent = shuffle(deck.all)[0];
+    } else {
+      newCurrent = null;
+    }
+    setCurrentCard(newCurrent);
+  }, [deck.all]);
 
-    // Test 1: SM-2 Again should reset reps and set 10min interval
-    const t1 = sm2Schedule({ ef: 2.5, interval: 0, reps: 3, due: 0 }, 0);
-    expect("SM2 Again sets 10min", t1.interval === 10*60*1000 && t1.reps === 0 && t1.due > Date.now());
-
-    // Test 2: First learn (reps=0) with Good → 1 day
-    const t2 = sm2Schedule({ ef: 2.5, interval: 0, reps: 0, due: 0 }, 2);
-    expect("SM2 first Good = 1 day", t2.interval === 24*60*60*1000 && t2.reps === 1);
-
-    // Test 3: Filter hay join produces no newline and lowercase search works
-    const demoCard = { titleRomaji: "Naruto", titleEnglish: "Naruto", titleNative: "ナルト", songTitle: "GO!", artists: "FLOW" };
-    const hay = [demoCard.titleRomaji, demoCard.titleEnglish, demoCard.titleNative, demoCard.songTitle, demoCard.artists].join(" ").toLowerCase();
-    expect("Filter hay join ok", typeof hay === "string" && !/\n/.test(hay) && hay.includes("flow"));
-
-    // Test 4: Incremental dedupe works — adding same id twice keeps one
-    const s = new Set();
-    const id = "123::OP1";
-    const before = s.size; s.add(id); s.add(id);
-    expect("Dedup Set keeps one", s.size === before + 1);
-
-    // Test 5: Negative filter case should not match
-    expect("Filter negative case", !hay.includes("xyz___unlikely___term"));
-
-    // Test 6: Later reviews grow interval with Good
-    const prevInt = 2*24*60*60*1000; // 2 days
-    const t6 = sm2Schedule({ ef: 2.5, interval: prevInt, reps: 2, due: 0 }, 2);
-    expect("SM2 grows after reps≥2", t6.interval > prevInt);
-
-    setTestResults(results);
-  }
-
-  const total = deck.all.length;
-  const dueCount = deck.due.length;
-  const learned = deck.all.filter(c => (srs[c.id]?.reps || 0) >= 3).length;
-
-  function clearCache() {
-    if (!confirm("Effacer le cache local des OP (AnimeThemes)?")) return;
-    setCache({});
-    localStorage.removeItem("amq_srs_cache_v1");  // <-- purge totale
-  }
+  const pageSize = 50;
+  const paginatedDeck = sortedDeck.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 p-6">
-      <div className="max-w-4xl mx-auto">
-        <header className="mb-6 flex items-center justify-between">
-          <h1 className="text-2xl font-bold">AMQ‑SRS Trainer <span className="text-sm font-normal">(AniList → AnimeThemes → Anki‑style)</span></h1>
-          <button className="text-sm underline" onClick={() => setShowSettings(s => !s)}>
-            {showSettings ? "Fermer" : "Réglages"}
-          </button>
-        </header>
-
-        <section className="mb-4 grid md:grid-cols-3 gap-3">
-          <div className="md:col-span-2 flex gap-2">
-            <input
-              className="w-full rounded-2xl border px-4 py-2"
-              placeholder="Ton username AniList"
-              value={username}
-              onChange={e => setUsername(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') buildDeckFromAniList(username); }}
-            />
-            <button
-              className="rounded-2xl px-4 py-2 bg-black text-white disabled:opacity-50"
-              disabled={!username.trim() || loading}
-              onClick={() => buildDeckFromAniList(username)}
-            >{loading ? `Import… ${progress.processedShows}/${progress.totalShows}` : "Charger"}</button>
-          </div>
-          <div className="flex gap-2">
-            <input
-              className="w-full rounded-2xl border px-4 py-2"
-              placeholder="Filtrer (anime / chanson / artiste)"
-              value={filterQuery}
-              onChange={e => setFilterQuery(e.target.value)}
-            />
-            <button className="rounded-2xl px-4 py-2 border" onClick={() => setFilterQuery("")}>Clear</button>
-          </div>
-        </section>
-
-        {/* Progress bar & actions while importing */}
-        {loading && (
-          <section className="mb-4">
-            <div className="mb-2 text-sm text-gray-600 flex items-center justify-between">
-              <span>Séries importées : {progress.processedShows} / {progress.totalShows} • OP ajoutés : {progress.totalOps}</span>
-              <div className="flex gap-2">
-                {cards.length > 0 && (
-                  <a href="#review" className="underline text-sm">Commencer à réviser maintenant</a>
-                )}
-                <button className="text-sm underline" onClick={cancelImport}>Arrêter l'import</button>
+    <ErrorBoundary>
+      <div className="min-h-screen bg-gray-50 text-gray-900 p-6">
+        <div className="flex justify-center">
+          <div className="max-w-4xl w-full">
+            <header className="mb-6 flex items-center justify-between">
+              <h1 className="text-2xl font-bold flex items-center gap-2">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 2L2 7L12 12L22 7L12 2Z" />
+                  <path d="M2 17L12 22L22 17" />
+                  <path d="M2 12L12 17L22 12" />
+                </svg>
+                Melfisk AMQ Training
+                <span className="text-sm font-normal">(AniList → AnimeThemes → Anki-style)</span>
+              </h1>
+              <div className="flex gap-3">
+                <button className="text-sm underline" onClick={() => setShowSettings(s => !s)}>
+                  {showSettings ? "Fermer" : "Réglages"}
+                </button>
+                <button className="text-sm underline" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+                  {theme === "dark" ? "Light" : "Dark"}
+                </button>
               </div>
-            </div>
-            <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
-              <div className="h-full bg-gray-800" style={{ width: `${progress.totalShows ? Math.min(100, Math.round(100 * progress.processedShows / progress.totalShows)) : 0}%` }} />
-            </div>
-          </section>
-        )}
+            </header>
 
-        {/* Review Card */}
-        <section id="review" className="rounded-2xl border p-4 bg-white shadow-sm">
-          {!current && (
-            <div className="text-center py-16">
-              <div className="text-lg font-semibold">Aucune carte à afficher.</div>
-              <div className="text-sm text-gray-600">Charge ta liste AniList pour créer le deck, ou attends que des cartes arrivent à échéance.</div>
+            <div className="mb-4 flex justify-center gap-4 text-sm text-gray-600">
+              <span>Total cartes: {globalStats.totalCards}</span>
+              <span>Cartes dues: {globalStats.dueCards}</span>
+              <span>Taux de succès: {globalStats.successRate}%</span>
             </div>
-          )}
 
-          {current && (
-            <div>
-              <div className="mb-3 flex items-center justify-between">
-                <div className="text-sm text-gray-600">Prochaine échéance: { current.srs?.due && current.srs?.due > now ? new Date(current.srs.due).toLocaleString() : "maintenant" }</div>
-                {current.videoUrl ? (
-                  <a className="text-sm underline" href={current.videoUrl} target="_blank" rel="noreferrer">Ouvrir la vidéo</a>
-                ) : (
-                  <span className="text-sm text-gray-400">Pas de lien vidéo</span>
-                )}
+            {showSettings && (
+              <div className="modal-overlay" onClick={() => setShowSettings(false)>
+                <section className="modal-content mb-6 rounded-2xl border p-4 bg-white shadow-sm animate-fadeIn" onClick={e => e.stopPropagation()}>
+                  <h2 className="text-lg font-bold mb-3">Réglages</h2>
+                  <div className="grid gap-4">
+                    <div>
+                      <label className="text-sm text-gray-600 mb-1 block">Délai Easy (heures)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="720"
+                        className="w-full rounded-2xl border px-4 py-2"
+                        value={easyDelayHours}
+                        onChange={(e) => setEasyDelayHours(Math.max(1, Math.min(720, parseInt(e.target.value) || 48)))}
+                      />
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        id="diffAgain"
+                        checked={diffAgain}
+                        onChange={(e) => setDiffAgain(e.target.checked)}
+                        className="rounded border"
+                      />
+                      <label htmlFor="diffAgain" className="text-sm text-gray-600">
+                        Différencier Again (10min) et Hard (immédiat)
+                      </label>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        id="autoPlay"
+                        checked={autoPlay}
+                        onChange={(e) => setAutoPlay(e.target.checked)}
+                        className="rounded border"
+                      />
+                      <label htmlFor="autoPlay" className="text-sm text-gray-600">
+                        Lecture automatique des vidéos
+                      </label>
+                    </div>
+                    <div>
+                      <label className="text-sm text-gray-600 mb-1 block">Trier le deck par</label>
+                      <select
+                        className="w-full rounded-2xl border px-4 py-2"
+                        value={sortMode}
+                        onChange={(e) => setSortMode(e.target.value)}
+                      >
+                        <option value="alpha">Titre (alphabétique)</option>
+                        <option value="due">Échéance</option>
+                        <option value="success">Taux de succès</option>
+                      </select>
+                    </div>
+                    <div>
+                      <button
+                        className="rounded-2xl px-4 py-2 border btn--danger"
+                        onClick={() => {
+                          if (confirm("Réinitialiser toutes les stats SRS (échéances, succès, essais) ?")) {
+                            setSrs({});
+                            localStorage.removeItem(STORAGE_KEY);
+                            setToast("Stats SRS réinitialisées");
+                          }
+                        }}
+                      >
+                        Réinitialiser les stats SRS
+                      </button>
+                    </div>
+                  </div>
+                </section>
               </div>
+            )}
 
-              {current.videoUrl && (
-                <div className="mb-2">
-                  <button
-                    className="text-xs underline"
-                    onClick={() => setHideVideo(v => !v)}
-                  >
-                    {hideVideo ? "Afficher l’image" : "Masquer l’image (garder le son)"}
-                  </button>
+            <section className="mb-4 grid md:grid-cols-3 gap-3 items-end">
+              <div>
+                <input
+                  className="w-full rounded-2xl border px-4 py-2"
+                  placeholder="AniList username"
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && username) importAnilist(setCards, setLoading, setError, cards, username); }}
+                />
+              </div>
+              <div>
+                <input
+                  className="w-full rounded-2xl border px-4 py-2"
+                  placeholder="Filtrer (titre, chanson, artistes)"
+                  value={filterQuery}
+                  onChange={e => setFilterQuery(e.target.value)}
+                />
+              </div>
+              <div className="flex justify-end items-center gap-2">
+                <button
+                  className="rounded-2xl px-4 py-2 border"
+                  onClick={() => setHideVideo(s => !s)}
+                >
+                  {hideVideo ? "Afficher" : "Cacher"} vidéo
+                </button>
+                <button
+                  className="rounded-2xl px-4 py-2 border btn--primary"
+                  disabled={loading || !username}
+                  onClick={() => importAnilist(setCards, setLoading, setError, cards, username)}
+                >
+                  Importer
+                </button>
+              </div>
+            </section>
+
+            {loading && (
+              <section className="mb-6 animate-pulse">
+                <div className="text-sm mb-2 text-gray-600">Importation en cours ({importProgress} / {idsRef.current.size})</div>
+                <div className="progress">
+                  <div
+                    className="progress__bar"
+                    style={{ width: `${(importProgress / (idsRef.current.size || 1)) * 100}%` }}
+                  />
+                </div>
+              </section>
+            )}
+
+            {toast && <Toast message={toast} onClose={() => setToast("")} />}
+
+            <section id="review" className="mb-6 flex justify-center">
+              {error && (
+                <div className="mb-4 p-4 bg-red-50 text-red-700 rounded-xl text-sm animate-fadeIn">
+                  {error}
                 </div>
               )}
-
-
-              {current.videoUrl ? (
-                <div
-                  className="mb-4"
-                  style={{ display: "flex", justifyContent: "center" }}
-                >
-                  <div
-                    style={{
-                      position: "relative",
-                      width: "100%",
-                      maxWidth: 720,        // largeur max ~720px
-                      aspectRatio: "16 / 9",// ratio stable
-                      overflow: "hidden",
-                      borderRadius: 12,
-                      background: "#000",
-                    }}
-                  >
-                    <video
-                      src={current.videoUrl}
-                      controls
-                      preload="metadata"
-                      // Taille vraiment limitée + image masquée via CSS filter (audio reste)
-                      style={{
-                        position: "absolute",
-                        inset: 0,
-                        width: "100%",
-                        height: "100%",
-                        objectFit: "contain",
-                        // si hideVideo => on noircit l'image (mais le son joue)
-                        filter: hideVideo ? "brightness(0) contrast(0)" : "none",
-                        zIndex: 0,
-                      }}
-                    />
-                    {/* Masque noir par-dessus (au cas où certains moteurs vidéo superposent encore) */}
-                    {hideVideo && (
+              {currentCard ? (
+                <div className="review-card p-4 rounded-2xl border bg-white shadow-sm w-full max-w-2xl">
+                  {currentCard.videoUrl ? (
+                    <div className="mb-4 video-shell">
                       <div
                         style={{
-                          position: "absolute",
-                          inset: 0,
+                          position: "relative",
+                          width: "100%",
+                          maxWidth: 720,
+                          aspectRatio: "16 / 9",
+                          overflow: "hidden",
+                          borderRadius: 12,
                           background: "#000",
-                          opacity: 1,
-                          zIndex: 5,
-                          pointerEvents: "none", // on laisse les contrôles cliquables à travers
+                          margin: "0 auto",
                         }}
-                      />
-                    )}
+                      >
+                        <video
+                          src={currentCard.videoUrl}
+                          controls
+                          autoPlay={autoPlay}
+                          preload="metadata"
+                          style={{
+                            position: "absolute",
+                            inset: 0,
+                            width: "100%",
+                            height: "100%",
+                            objectFit: "contain",
+                            filter: hideVideo ? "brightness(0) contrast(0)" : "none",
+                            zIndex: 0,
+                          }}
+                        />
+                        {hideVideo && (
+                          <div
+                            style={{
+                              position: "absolute",
+                              inset: 0,
+                              background: "#000",
+                              opacity: 1,
+                              zIndex: 5,
+                              pointerEvents: "none",
+                            }}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mb-4 p-4 bg-gray-100 rounded-xl text-center text-sm">
+                      Pas d'aperçu vidéo disponible.
+                    </div>
+                  )}
+
+                  <div className="mb-3">
+                    <input
+                      ref={answerRef}
+                      className="w-full rounded-2xl border px-4 py-2"
+                      placeholder="Tape ta réponse (titre de l'anime)"
+                      onKeyDown={(e) => { if (e.key === "Enter") setShowAnswer(true); }}
+                    />
                   </div>
+
+                  {!showAnswer ? (
+                    <div className="flex justify-center">
+                      <button className="rounded-2xl px-6 py-2 border btn--primary" onClick={() => setShowAnswer(true)}>
+                        Révéler
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-2 animate-reveal">
+                      <div className="text-center">
+                        <div className="text-xl font-bold">{currentCard.titleRomaji || currentCard.titleEnglish || currentCard.titleNative}</div>
+                        <div className="text-sm text-gray-600">OP{currentCard.opNumber || 1} — {currentCard.songTitle || 'Titre inconnu'} {currentCard.artists ? `• ${currentCard.artists.join(", ")}` : ''}</div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 mt-3">
+                        <button className="rounded-xl px-3 py-2 bg-red-50 border border-red-200" onClick={() => grade(0)}>Again (A)</button>
+                        <button className="rounded-xl px-3 py-2 bg-yellow-50 border border-yellow-200" onClick={() => grade(1)}>Hard (H)</button>
+                        <button className="rounded-xl px-3 py-2 bg-blue-50 border border-blue-200" onClick={() => grade(2)}>Easy (E)</button>
+                      </div>
+                      {lastGrade && (
+                        <button className="text-sm underline mt-2" onClick={undoGrade}>
+                          Undo dernier grade
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="mb-4 p-4 bg-gray-100 rounded-xl text-center text-sm">
-                  Pas d'aperçu vidéo disponible.
+                  Aucune carte à réviser. Importe un utilisateur AniList pour commencer.
                 </div>
               )}
+            </section>
 
-
-
-
-              <div className="mb-3">
-                <input ref={answerRef} className="w-full rounded-2xl border px-4 py-2" placeholder="Tape ta réponse (titre de l'anime)" onKeyDown={(e)=>{ if(e.key==='Enter') setShowAnswer(true); }} />
+            <section className="mt-6 flex justify-center">
+              <div className="w-full max-w-4xl">
+                <div className="text-sm mb-2 text-gray-600 flex justify-between items-center">
+                  Deck ({deck.all.length})
+                  <div className="flex gap-2">
+                    <button
+                      className="rounded-xl px-3 py-2 border"
+                      disabled={currentPage === 1}
+                      onClick={() => setCurrentPage(p => p - 1)}
+                    >
+                      Préc
+                    </button>
+                    <span>Page {currentPage} / {Math.ceil(sortedDeck.length / pageSize)}</span>
+                    <button
+                      className="rounded-xl px-3 py-2 border"
+                      disabled={currentPage >= Math.ceil(sortedDeck.length / pageSize)}
+                      onClick={() => setCurrentPage(p => p + 1)}
+                    >
+                      Suiv
+                    </button>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm table mx-auto">
+                    <thead>
+                      <tr className="text-left border-b">
+                        <th className="py-2 pr-2">Anime</th>
+                        <th className="py-2 pr-2">OP</th>
+                        <th className="py-2 pr-2">Chanson</th>
+                        <th className="py-2 pr-2">Artistes</th>
+                        <th className="py-2 pr-2">Échéance</th>
+                        <th className="py-2 pr-2">Succès</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {paginatedDeck.map(c => (
+                        <tr key={c.id} className="border-b hover:bg-gray-50">
+                          <td className="py-2 pr-2">{c.titleRomaji || c.titleEnglish || c.titleNative}</td>
+                          <td className="py-2 pr-2">OP{c.opNumber || 1}</td>
+                          <td className="py-2 pr-2">{c.songTitle || "—"}</td>
+                          <td className="py-2 pr-2">{c.artists ? c.artists.join(", ") : "?"}</td>
+                          <td className="py-2 pr-2">{c.srs?.due ? new Date(c.srs.due).toLocaleString() : "à réviser"}</td>
+                          <td className="py-2 pr-2">
+                            {c.srs?.attempts > 0
+                              ? `${Math.round((c.srs.successes / c.srs.attempts) * 100)}% (${c.srs.successes}/${c.srs.attempts})`
+                              : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
+            </section>
 
-              {!showAnswer ? (
-                <div className="flex justify-center">
-                  <button className="rounded-2xl px-6 py-2 border" onClick={()=>setShowAnswer(true)}>Révéler</button>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="text-center">
-                    <div className="text-xl font-bold">{current.titleRomaji || current.titleEnglish || current.titleNative}</div>
-                    <div className="text-sm text-gray-600">OP{current.opNumber || 1} — {current.songTitle || 'Titre inconnu'} {current.artists ? `• ${current.artists}` : ''}</div>
-                  </div>
-
-                  <div className="grid grid-cols-4 gap-2 mt-3">
-                    <button className="rounded-xl px-3 py-2 bg-red-50 border border-red-200" onClick={()=>grade(0)}>Again</button>
-                    <button className="rounded-xl px-3 py-2 bg-yellow-50 border border-yellow-200" onClick={()=>grade(1)}>Hard</button>
-                    <button className="rounded-xl px-3 py-2 bg-green-50 border border-green-200" onClick={()=>grade(2)}>Good</button>
-                    <button className="rounded-xl px-3 py-2 bg-blue-50 border border-blue-200" onClick={()=>grade(3)}>Easy</button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-
-        {/* Deck table */}
-        <section className="mt-6">
-          <div className="text-sm mb-2 text-gray-600">Deck ({deck.all.length})</div>
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead>
-                <tr className="text-left border-b">
-                  <th className="py-2 pr-2">Anime</th>
-                  <th className="py-2 pr-2">OP</th>
-                  <th className="py-2 pr-2">Chanson</th>
-                  <th className="py-2 pr-2">Artistes</th>
-                  <th className="py-2 pr-2">Échéance</th>
-                </tr>
-              </thead>
-              <tbody>
-                {deck.all.map(c => (
-                  <tr key={c.id} className="border-b hover:bg-gray-50">
-                    <td className="py-2 pr-2">{c.titleRomaji || c.titleEnglish || c.titleNative}</td>
-                    <td className="py-2 pr-2">OP{c.opNumber || 1}</td>
-                    <td className="py-2 pr-2">{c.songTitle || "—"}</td>
-                    <td className="py-2 pr-2">{c.artists || "—"}</td>
-                    <td className="py-2 pr-2">{srs[c.id]?.due ? new Date(srs[c.id].due).toLocaleString() : "à réviser"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <footer className="mt-8 text-xs text-gray-500 flex justify-center">
+              <div>
+                <p>
+                  Sources : AniList GraphQL • AnimeThemes.moe. Ce projet n'est affilié ni à AMQ ni à Anki.
+                </p>
+              </div>
+            </footer>
           </div>
-        </section>
-
-        <footer className="mt-8 text-xs text-gray-500">
-          <button
-            className="rounded-xl px-3 py-2 border text-xs ml-2"
-            onClick={clearCache}
-          >
-            Effacer le cache OP
-          </button>
-          <p>
-            Sources : AniList GraphQL • AnimeThemes.moe. Ce projet n'est affilié ni à AMQ ni à Anki.
-          </p>
-          <div className="mt-2">
-            <button className="rounded-xl px-3 py-2 border text-xs" onClick={runSelfTests}>Exécuter les tests</button>
-            {testResults.length > 0 && (
-              <ul className="mt-2 list-disc pl-5 space-y-0.5">
-                {testResults.map((t,i)=> (
-                  <li key={i} className={t.pass ? "text-green-700" : "text-red-700"}>
-                    {t.pass ? "✔" : "✘"} {t.label}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </footer>
+        </div>
       </div>
-    </div>
+    </ErrorBoundary>
   );
 }
